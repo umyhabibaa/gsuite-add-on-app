@@ -1,0 +1,17 @@
+{
+  "name": "gsuite-add-on-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Quill Draft — Gmail add-on that suggests a reply and inserts it as a draft.",
+  "scripts": {
+    "preview": "node scripts/preview.mjs",
+    "validate": "node scripts/validate.mjs",
+    "clasp:login": "npx @google/clasp login",
+    "clasp:create": "npx @google/clasp create --type standalone --title \"Quill Draft\"",
+    "clasp:push": "npx @google/clasp push",
+    "clasp:open": "npx @google/clasp open-script"
+  },
+  "devDependencies": {
+    "@google/clasp": "^3.0.6"
+  }
+}
