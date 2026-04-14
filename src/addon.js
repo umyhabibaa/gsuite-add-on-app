@@ -57,7 +57,7 @@ function insertSuggestedReplyDraft(e) {
     var fromAddr = message.getFrom() || "";
     var draftBody =
       getCachedDraftForMessage_(message.getId()) ||
-      buildSuggestedReplyPlain_(subject, plain, fromAddr, message.getId());
+      buildSuggestedReplyPlain_(subject, plain, fromAddr, message.getId(), false);
     var draft = message.createDraftReply(draftBody);
     return CardService.newComposeActionResponseBuilder().setGmailDraft(draft).build();
   } catch (err) {
@@ -65,6 +65,36 @@ function insertSuggestedReplyDraft(e) {
       .setNotification(
         CardService.newNotification().setText(
           "Could not create draft: " + (err && err.message ? err.message : String(err))
+        )
+      )
+      .build();
+  }
+}
+
+function regenerateSuggestedReplyDraft(e) {
+  if (!e || !e.gmail || !e.gmail.accessToken || !e.gmail.messageId) {
+    return CardService.newActionResponseBuilder()
+      .setNotification(
+        CardService.newNotification().setText(
+          "Open an email in Gmail first, then use Quill Draft from the side panel."
+        )
+      )
+      .build();
+  }
+  try {
+    GmailApp.setCurrentMessageAccessToken(e.gmail.accessToken);
+    var message = GmailApp.getMessageById(e.gmail.messageId);
+    clearDraftCacheForMessage_(message.getId());
+    var card = buildReplyDraftCard_(message, true);
+    return CardService.newActionResponseBuilder()
+      .setNavigation(CardService.newNavigation().updateCard(card))
+      .setNotification(CardService.newNotification().setText("Draft regenerated"))
+      .build();
+  } catch (err) {
+    return CardService.newActionResponseBuilder()
+      .setNotification(
+        CardService.newNotification().setText(
+          "Could not regenerate: " + (err && err.message ? err.message : String(err))
         )
       )
       .build();
@@ -123,12 +153,18 @@ function buildNonGmailCard_() {
     .build();
 }
 
-function buildReplyDraftCard_(message) {
+function buildReplyDraftCard_(message, optRegenerate) {
   var subject = message.getSubject() || "(no subject)";
   var from = message.getFrom() || "";
   var plain = message.getPlainBody() || "";
   var preview = truncateForCard_(stripQuotedReply_(plain), 720);
-  var suggestion = buildSuggestedReplyPlain_(subject, plain, from, message.getId());
+  var suggestion = buildSuggestedReplyPlain_(
+    subject,
+    plain,
+    from,
+    message.getId(),
+    !!optRegenerate
+  );
   var suggestionPreview = truncateForCard_(suggestion, 1100);
 
   return CardService.newCardBuilder()
@@ -175,12 +211,22 @@ function buildReplyDraftCard_(message) {
           )
         )
         .addWidget(
-          CardService.newTextButton()
-            .setText("Insert draft into reply")
-            .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
-            .setBackgroundColor(ACCENT_BUTTON)
-            .setOnClickAction(
-              CardService.newAction().setFunctionName("insertSuggestedReplyDraft")
+          CardService.newButtonSet()
+            .addButton(
+              CardService.newTextButton()
+                .setText("Regenerate")
+                .setOnClickAction(
+                  CardService.newAction().setFunctionName("regenerateSuggestedReplyDraft")
+                )
+            )
+            .addButton(
+              CardService.newTextButton()
+                .setText("Insert draft into reply")
+                .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+                .setBackgroundColor(ACCENT_BUTTON)
+                .setOnClickAction(
+                  CardService.newAction().setFunctionName("insertSuggestedReplyDraft")
+                )
             )
         )
     )
@@ -209,11 +255,12 @@ function brandHeader_(subtitle, hint) {
 /**
  * Builds a reply draft: OpenAI when OPENAI_API_KEY is set, otherwise a small static fallback.
  * Caches the result per message so "Insert draft" matches the card.
+ * @param {boolean} regenerate When true, asks the model for an alternate wording (or varies static fallback).
  */
-function buildSuggestedReplyPlain_(subject, plainBody, fromAddr, messageId) {
-  var draft = fetchSuggestedReplyFromOpenAI_(subject, plainBody, fromAddr);
+function buildSuggestedReplyPlain_(subject, plainBody, fromAddr, messageId, regenerate) {
+  var draft = fetchSuggestedReplyFromOpenAI_(subject, plainBody, fromAddr, !!regenerate);
   if (!draft) {
-    draft = buildStaticFallbackReply_(subject, plainBody);
+    draft = buildStaticFallbackReply_(subject, plainBody, !!regenerate);
   }
   if (messageId) {
     cacheDraftForMessage_(messageId, draft);
@@ -221,7 +268,7 @@ function buildSuggestedReplyPlain_(subject, plainBody, fromAddr, messageId) {
   return draft;
 }
 
-function buildStaticFallbackReply_(subject, plainBody) {
+function buildStaticFallbackReply_(subject, plainBody, regenerate) {
   var body = stripQuotedReply_(plainBody);
   body = body.replace(/\s+/g, " ").trim();
   var subj = (subject || "").replace(/\s+/g, " ").trim() || "(no subject)";
@@ -234,9 +281,15 @@ function buildStaticFallbackReply_(subject, plainBody) {
     ""
   ];
   if (body) {
-    lines.push(
-      "I've read your note and will follow up soon. Let me know if you need anything urgently."
-    );
+    if (regenerate) {
+      lines.push(
+        "I've noted your message and will follow up shortly. If anything is time-sensitive, reply and I'll prioritize it."
+      );
+    } else {
+      lines.push(
+        "I've read your note and will follow up soon. Let me know if you need anything urgently."
+      );
+    }
     lines.push("");
   }
   lines.push("Best regards");
@@ -280,6 +333,17 @@ function cacheDraftForMessage_(messageId, draftText) {
   }
 }
 
+function clearDraftCacheForMessage_(messageId) {
+  if (!messageId) {
+    return;
+  }
+  try {
+    CacheService.getUserCache().remove(DRAFT_CACHE_PREFIX + messageId);
+  } catch (err) {
+    Logger.log("clearDraftCacheForMessage_: " + err);
+  }
+}
+
 function getCachedDraftForMessage_(messageId) {
   if (!messageId) {
     return null;
@@ -292,7 +356,7 @@ function getCachedDraftForMessage_(messageId) {
   }
 }
 
-function fetchSuggestedReplyFromOpenAI_(subject, plainBody, fromAddr) {
+function fetchSuggestedReplyFromOpenAI_(subject, plainBody, fromAddr, regenerate) {
   var apiKey = getOpenAIApiKey_();
   if (!apiKey) {
     return null;
@@ -312,6 +376,11 @@ function fetchSuggestedReplyFromOpenAI_(subject, plainBody, fromAddr) {
     subj +
     "\n\nMessage (quoted sections may be omitted):\n" +
     (stripped || "(empty)");
+  if (regenerate) {
+    userPrompt +=
+      "\n\nRegenerate: write a fresh alternative reply. Change wording and structure where reasonable " +
+      "while staying accurate to the thread—do not repeat phrasing from a typical first draft.";
+  }
 
   var systemPrompt =
     "You are a helpful email assistant. Draft a reply body in plain text only—no subject line, " +
@@ -329,6 +398,9 @@ function fetchSuggestedReplyFromOpenAI_(subject, plainBody, fromAddr) {
     ],
     max_completion_tokens: 2048
   };
+  if (regenerate) {
+    payload.temperature = 0.85;
+  }
 
   try {
     var response = UrlFetchApp.fetch("https://api.openai.com/v1/chat/completions", {
