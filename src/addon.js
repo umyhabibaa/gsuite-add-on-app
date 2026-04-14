@@ -1,8 +1,26 @@
 /** Display name shown in Gmail toolbar and card headers. */
 var ADDON_NAME = "Quill Draft";
 
-/** Accent used for primary button (CardService accepts #RRGGBB). */
-var ACCENT_BUTTON = "#4f46e5";
+/**
+ * Primary actions — teal to match addOns.common.layoutProperties in appsscript.json
+ * (distinct from default Gmail / Google blues).
+ */
+var ACCENT_BUTTON = "#0d9488";
+/** Card header + manifest logo: neutral “writing” icon, not the Gmail product mark. */
+var BRAND_HEADER_ICON_URL =
+  "https://www.gstatic.com/images/icons/material/system/1x/edit_note_black_48dp.png";
+
+/** OpenAI Chat Completions model for reply drafts. */
+var OPENAI_MODEL = "gpt-5.4-mini";
+
+/** Script property name for the API key (Project settings → Script properties). */
+var OPENAI_API_KEY_PROPERTY = "OPENAI_API_KEY";
+
+/** User cache prefix so Insert uses the same draft as the card preview. */
+var DRAFT_CACHE_PREFIX = "quill_draft_v1_";
+
+/** Max characters of thread body sent to the model (keeps requests bounded). */
+var OPENAI_MAX_BODY_CHARS = 32000;
 
 function onHomepage(e) {
   return [buildHomeOrWaitCard_(e)];
@@ -36,7 +54,10 @@ function insertSuggestedReplyDraft(e) {
     var message = GmailApp.getMessageById(e.gmail.messageId);
     var plain = message.getPlainBody();
     var subject = message.getSubject();
-    var draftBody = buildSuggestedReplyPlain_(subject, plain);
+    var fromAddr = message.getFrom() || "";
+    var draftBody =
+      getCachedDraftForMessage_(message.getId()) ||
+      buildSuggestedReplyPlain_(subject, plain, fromAddr, message.getId());
     var draft = message.createDraftReply(draftBody);
     return CardService.newComposeActionResponseBuilder().setGmailDraft(draft).build();
   } catch (err) {
@@ -107,7 +128,7 @@ function buildReplyDraftCard_(message) {
   var from = message.getFrom() || "";
   var plain = message.getPlainBody() || "";
   var preview = truncateForCard_(stripQuotedReply_(plain), 720);
-  var suggestion = buildSuggestedReplyPlain_(subject, plain);
+  var suggestion = buildSuggestedReplyPlain_(subject, plain, from, message.getId());
   var suggestionPreview = truncateForCard_(suggestion, 1100);
 
   return CardService.newCardBuilder()
@@ -180,14 +201,27 @@ function brandHeader_(subtitle, hint) {
   return CardService.newCardHeader()
     .setTitle(ADDON_NAME)
     .setSubtitle(hint ? subtitle + " · " + hint : subtitle)
-    .setImageUrl(
-      "https://www.gstatic.com/images/branding/product/2x/gmail_48dp.png"
-    )
+    .setImageUrl(BRAND_HEADER_ICON_URL)
     .setImageStyle(CardService.ImageStyle.SQUARE)
-    .setImageAltText(ADDON_NAME);
+    .setImageAltText(ADDON_NAME + " add-on");
 }
 
-function buildSuggestedReplyPlain_(subject, plainBody) {
+/**
+ * Builds a reply draft: OpenAI when OPENAI_API_KEY is set, otherwise a small static fallback.
+ * Caches the result per message so "Insert draft" matches the card.
+ */
+function buildSuggestedReplyPlain_(subject, plainBody, fromAddr, messageId) {
+  var draft = fetchSuggestedReplyFromOpenAI_(subject, plainBody, fromAddr);
+  if (!draft) {
+    draft = buildStaticFallbackReply_(subject, plainBody);
+  }
+  if (messageId) {
+    cacheDraftForMessage_(messageId, draft);
+  }
+  return draft;
+}
+
+function buildStaticFallbackReply_(subject, plainBody) {
   var body = stripQuotedReply_(plainBody);
   body = body.replace(/\s+/g, " ").trim();
   var subj = (subject || "").replace(/\s+/g, " ").trim() || "(no subject)";
@@ -207,6 +241,122 @@ function buildSuggestedReplyPlain_(subject, plainBody) {
   }
   lines.push("Best regards");
   return lines.join("\n");
+}
+
+function normalizeChatContent_(content) {
+  if (content == null) {
+    return "";
+  }
+  if (typeof content === "string") {
+    return content.replace(/^\s+|\s+$/g, "");
+  }
+  if (Object.prototype.toString.call(content) === "[object Array]") {
+    var parts = [];
+    for (var i = 0; i < content.length; i++) {
+      var p = content[i];
+      if (p && typeof p.text === "string") {
+        parts.push(p.text);
+      } else if (typeof p === "string") {
+        parts.push(p);
+      }
+    }
+    return parts.join("").replace(/^\s+|\s+$/g, "");
+  }
+  return "";
+}
+
+function getOpenAIApiKey_() {
+  return PropertiesService.getScriptProperties().getProperty(OPENAI_API_KEY_PROPERTY);
+}
+
+function cacheDraftForMessage_(messageId, draftText) {
+  if (!messageId || !draftText) {
+    return;
+  }
+  try {
+    CacheService.getUserCache().put(DRAFT_CACHE_PREFIX + messageId, draftText, 600);
+  } catch (err) {
+    Logger.log("cacheDraftForMessage_: " + err);
+  }
+}
+
+function getCachedDraftForMessage_(messageId) {
+  if (!messageId) {
+    return null;
+  }
+  try {
+    return CacheService.getUserCache().get(DRAFT_CACHE_PREFIX + messageId) || null;
+  } catch (err) {
+    Logger.log("getCachedDraftForMessage_: " + err);
+    return null;
+  }
+}
+
+function fetchSuggestedReplyFromOpenAI_(subject, plainBody, fromAddr) {
+  var apiKey = getOpenAIApiKey_();
+  if (!apiKey) {
+    return null;
+  }
+
+  var stripped = stripQuotedReply_(plainBody || "");
+  if (stripped.length > OPENAI_MAX_BODY_CHARS) {
+    stripped = stripped.substring(0, OPENAI_MAX_BODY_CHARS) + "\n…";
+  }
+  var subj = (subject || "").replace(/\s+/g, " ").trim() || "(no subject)";
+  var fromLine = (fromAddr || "").replace(/\s+/g, " ").trim() || "(unknown)";
+
+  var userPrompt =
+    "From: " +
+    fromLine +
+    "\nSubject: " +
+    subj +
+    "\n\nMessage (quoted sections may be omitted):\n" +
+    (stripped || "(empty)");
+
+  var systemPrompt =
+    "You are a helpful email assistant. Draft a reply body in plain text only—no subject line, " +
+    "no markdown code fences unless the thread clearly needs them. Match tone to the thread " +
+    "(professional, friendly, concise, or detailed as appropriate). Anticipate likely questions " +
+    "and next steps; be proactive but accurate. Do not invent facts, meetings, or commitments " +
+    "not implied by the message. If the sender asked for something specific, address it directly. " +
+    "Output only the reply text—no preamble like \"Here is a draft\".";
+
+  var payload = {
+    model: OPENAI_MODEL,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt }
+    ],
+    max_completion_tokens: 2048
+  };
+
+  try {
+    var response = UrlFetchApp.fetch("https://api.openai.com/v1/chat/completions", {
+      method: "post",
+      contentType: "application/json",
+      headers: { Authorization: "Bearer " + apiKey },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+    var code = response.getResponseCode();
+    var raw = response.getContentText();
+    if (code !== 200) {
+      Logger.log("OpenAI error HTTP " + code + ": " + raw.substring(0, 800));
+      return null;
+    }
+    var data = JSON.parse(raw);
+    var choice = data.choices && data.choices[0];
+    var msg = choice && choice.message;
+    var text = normalizeChatContent_(msg && msg.content);
+    if (!text.replace(/\s/g, "")) {
+      Logger.log("OpenAI empty content");
+      return null;
+    }
+    return text;
+  } catch (err) {
+    Logger.log("fetchSuggestedReplyFromOpenAI_: " + err);
+    return null;
+  }
 }
 
 function stripQuotedReply_(text) {

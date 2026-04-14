@@ -9,13 +9,16 @@
     "https://www.googleapis.com/auth/gmail.addons.current.action.compose",
     "https://www.googleapis.com/auth/script.external_request"
   ],
+  "urlFetchWhitelist": [
+    "https://api.openai.com/"
+  ],
   "addOns": {
     "common": {
       "name": "Quill Draft",
-      "logoUrl": "https://www.gstatic.com/images/branding/product/2x/gmail_48dp.png",
+      "logoUrl": "https://www.gstatic.com/images/icons/material/system/1x/edit_note_black_48dp.png",
       "layoutProperties": {
-        "primaryColor": "#4f46e5",
-        "secondaryColor": "#6366f1"
+        "primaryColor": "#115e59",
+        "secondaryColor": "#2dd4bf"
       },
       "homepageTrigger": {
         "runFunction": "onHomepage"
